@@ -7,18 +7,7 @@
 
 #define THREADS_PER_BLOCK_NONCE 256
 #define THREADS_PER_BLOCK_MERKLE_INIT 256
-#define THREADS_PER_BLOCK_MERKLE_REDUCE 128
-
-// --- Helper Macro for CUDA Error Checking ---
-#define checkCudaErrors(val) check_cuda( (val), #val, __FILE__, __LINE__ )
-void check_cuda(cudaError_t result, char const *const func, const char *const file, int const line) {
-    if (result) {
-        fprintf(stderr, "CUDA error at %s:%d code=%d(%s) \"%s\" \n",
-                file, line, static_cast<unsigned int>(result), cudaGetErrorString(result), func);
-        cudaDeviceReset(); // Resets the device on error
-        exit(99);
-    }
-}
+#define THREADS_PER_BLOCK_MERKLE_REDUCE 256
 
 // CUDA sprintf alternative for nonce finding. Converts integer to its string representation. Returns string's length.
 __device__ int intToString(uint64_t num, char* out) {
@@ -106,7 +95,7 @@ __host__ __device__ int compare_hashes(BYTE* hash1, BYTE* hash2) {
 }
 
 __global__ void reduce_merkle_level_kernel(
-    const BYTE* d_input_hashes,
+    BYTE* d_input_hashes,
     int num_input_hashes,
     BYTE* d_output_hashes)
 {
@@ -123,32 +112,34 @@ __global__ void reduce_merkle_level_kernel(
     if (out_idx >= out_hashes_count) return;
 
     // Buffers for the two input hashes
-    BYTE hash1[SHA256_HASH_SIZE];
-    BYTE hash2[SHA256_HASH_SIZE];
+    BYTE *hash1;
+    BYTE *hash2;
 
     // Load hash1
     if (in_idx1 < num_input_hashes) {
-        d_strcpy((char*)hash1, (const char*)&d_input_hashes[in_idx1 * SHA256_HASH_SIZE]);
+        hash1 = d_input_hashes + in_idx1 * SHA256_HASH_SIZE;
     } else {
-        hash1[0] = '\0'; // Padding
+        // todo idk
     }
 
     // Load hash2
     if (in_idx2 < num_input_hashes) {
-        d_strcpy((char*)hash2, (const char*)&d_input_hashes[in_idx2 * SHA256_HASH_SIZE]);
+        hash2 = d_input_hashes + in_idx2 * SHA256_HASH_SIZE;
     } else {
-        // Odd number of hashes, so we need to duplicate hash1
-        d_strcpy((char*)hash2, (char*)hash1);
+        // If there's no second hash, we need to duplicate the first one
+        hash2 = hash1;
     }
 
     // Shouldn't be necessary, but just in case
     if (hash1[0] != '\0') {
-        BYTE combined[(SHA256_HASH_SIZE - 1) * 2 + 1];
-        d_strcpy((char*)combined, (char*)hash1);
-        d_strcat((char*)combined, (char*)hash2);
-        apply_sha256(combined, &d_output_hashes[out_idx * SHA256_HASH_SIZE]);
+        // Concatenate the two hashes
+        BYTE concatenated_hashes[SHA256_HASH_SIZE * 2 + 1];
+        d_strcpy((char *) concatenated_hashes, (char *)hash1);
+        d_strcat((char *)concatenated_hashes, (char *)hash2);
+
+        // Compute the SHA256 hash of the concatenated hashes
+        apply_sha256(concatenated_hashes, d_output_hashes + out_idx * SHA256_HASH_SIZE);
     } else {
-        d_output_hashes[out_idx * SHA256_HASH_SIZE] = '\0';
     }
 }
 
@@ -179,26 +170,26 @@ void construct_merkle_root(int transaction_size_bytes, BYTE *transactions_host, 
     /* Ping Pong style buffers */
     BYTE *dev_hashes_ping, *dev_hashes_pong;
 
-    checkCudaErrors(cudaMalloc((void**)&transactions_dev, transactions_count * transaction_size_bytes));
-    checkCudaErrors(cudaMemcpy(transactions_dev, transactions_host, transactions_count * transaction_size_bytes, cudaMemcpyHostToDevice));
+    cudaMalloc((void**)&transactions_dev, transactions_count * transaction_size_bytes);
+    cudaMemcpy(transactions_dev, transactions_host, transactions_count * transaction_size_bytes, cudaMemcpyHostToDevice);
 
-    checkCudaErrors(cudaMalloc((void**)&dev_hashes_ping, transactions_count * SHA256_HASH_SIZE));
+    cudaMalloc((void**)&dev_hashes_ping, transactions_count * SHA256_HASH_SIZE);
 
     int threads_per_block = THREADS_PER_BLOCK_MERKLE_INIT;
     /* Ceil the number of blocks */
     int blocks_no = (transactions_count + threads_per_block - 1) / threads_per_block;
 
     initial_hash_kernel<<<blocks_no, threads_per_block>>>(transactions_dev, transaction_size_bytes, transactions_count, dev_hashes_ping);
-    checkCudaErrors(cudaGetLastError());
-    checkCudaErrors(cudaDeviceSynchronize());
-    checkCudaErrors(cudaFree(transactions_dev));
+    cudaGetLastError();
+    cudaDeviceSynchronize();
+    cudaFree(transactions_dev);
 
     int n_hashes = transactions_count;
 
     /************************************* REDUCTION PHASE ***********************************/
 
     // Max hashes for next level (output of reduction)
-    checkCudaErrors(cudaMalloc((void**)&dev_hashes_pong, ((n_hashes + 1) / 2) * SHA256_HASH_SIZE));
+    cudaMalloc((void**)&dev_hashes_pong, ((n_hashes + 1) / 2) * SHA256_HASH_SIZE);
 
     int threads_per_block_reduce = THREADS_PER_BLOCK_MERKLE_REDUCE;
 
@@ -213,8 +204,8 @@ void construct_merkle_root(int transaction_size_bytes, BYTE *transactions_host, 
                 dev_hashes_ping,
                 n_hashes,
                 dev_hashes_pong);
-            checkCudaErrors(cudaGetLastError());
-            checkCudaErrors(cudaDeviceSynchronize());
+            cudaGetLastError();
+            cudaDeviceSynchronize();
         }
 
         n_hashes = out_hashes_on_this_level;
@@ -229,10 +220,10 @@ void construct_merkle_root(int transaction_size_bytes, BYTE *transactions_host, 
         }
     }
     // In the end, the first hash in dev_hashes_ping is the Merkle root
-    checkCudaErrors(cudaMemcpy(merkle_root_host, dev_hashes_ping, SHA256_HASH_SIZE, cudaMemcpyDeviceToHost));
+    cudaMemcpy(merkle_root_host, dev_hashes_ping, SHA256_HASH_SIZE, cudaMemcpyDeviceToHost);
 
-    checkCudaErrors(cudaFree(dev_hashes_ping));
-    checkCudaErrors(cudaFree(dev_hashes_pong));
+    cudaFree(dev_hashes_ping);
+    cudaFree(dev_hashes_pong);
 }
 
 // TODO 2: Implement this function in CUDA
