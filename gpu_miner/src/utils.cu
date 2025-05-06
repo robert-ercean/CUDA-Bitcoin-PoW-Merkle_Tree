@@ -105,15 +105,61 @@ __host__ __device__ int compare_hashes(BYTE* hash1, BYTE* hash2) {
     return 0; // hashes are equal
 }
 
+__global__ void reduce_merkle_level_kernel(
+    const BYTE* d_input_hashes,
+    int num_input_hashes,
+    BYTE* d_output_hashes)
+{
+    const int tid = threadIdx.x;
+    const int out_idx = blockIdx.x * blockDim.x + tid;
+
+    const int in_idx1 = out_idx * 2;
+    const int in_idx2 = in_idx1 + 1;
+    
+    // Each thread processes 2 input hashes to output 1 hash
+    const int out_hashes_count = (num_input_hashes + 1) / 2;
+    
+    // Sanity check
+    if (out_idx >= out_hashes_count) return;
+
+    // Buffers for the two input hashes
+    BYTE hash1[SHA256_HASH_SIZE];
+    BYTE hash2[SHA256_HASH_SIZE];
+
+    // Load hash1
+    if (in_idx1 < num_input_hashes) {
+        d_strcpy((char*)hash1, (const char*)&d_input_hashes[in_idx1 * SHA256_HASH_SIZE]);
+    } else {
+        hash1[0] = '\0'; // Padding
+    }
+
+    // Load hash2
+    if (in_idx2 < num_input_hashes) {
+        d_strcpy((char*)hash2, (const char*)&d_input_hashes[in_idx2 * SHA256_HASH_SIZE]);
+    } else {
+        // Odd number of hashes, so we need to duplicate hash1
+        d_strcpy((char*)hash2, (char*)hash1);
+    }
+
+    // Shouldn't be necessary, but just in case
+    if (hash1[0] != '\0') {
+        BYTE combined[(SHA256_HASH_SIZE - 1) * 2 + 1];
+        d_strcpy((char*)combined, (char*)hash1);
+        d_strcat((char*)combined, (char*)hash2);
+        apply_sha256(combined, &d_output_hashes[out_idx * SHA256_HASH_SIZE]);
+    } else {
+        d_output_hashes[out_idx * SHA256_HASH_SIZE] = '\0';
+    }
+}
 
 
-/* Kernel for the hashing of the initial transactions */
-__global__ void initial_hash_kernel(const BYTE* transactions_device, int transaction_size_bytes, int num_transactions, BYTE* d_output_hashes) {
+/* Level 0 hashing of the initial transactions */
+__global__ void initial_hash_kernel(const BYTE* transactions_device, int transaction_size_bytes, int num_transactions, BYTE* dev_out_hashes) {
     int tid = threadIdx.x + blockDim.x * blockIdx.x;
 
     if (tid < num_transactions) {
         const BYTE* src = transactions_device + tid * transaction_size_bytes;
-        BYTE* dest = d_output_hashes + tid * SHA256_HASH_SIZE;
+        BYTE* dest = dev_out_hashes + tid * SHA256_HASH_SIZE;
         
         apply_sha256(src, dest);
     }
@@ -127,30 +173,66 @@ __global__ void initial_hash_kernel(const BYTE* transactions_device, int transac
  * @param merkle_root_host Pointer to the host memory where the Merkle root will be stored
  * */
 void construct_merkle_root(int transaction_size_bytes, BYTE *transactions_host, int max_transactions_in_a_block, int transactions_count, BYTE merkle_root_host[SHA256_HASH_SIZE]) {
+
     /****************************** INITIAL TRANSACTION HASHING ******************************/
     BYTE *transactions_dev;
     /* Ping Pong style buffers */
-    BYTE *d_hashes_ping, *d_hashes_pong;
+    BYTE *dev_hashes_ping, *dev_hashes_pong;
 
     checkCudaErrors(cudaMalloc((void**)&transactions_dev, transactions_count * transaction_size_bytes));
     checkCudaErrors(cudaMemcpy(transactions_dev, transactions_host, transactions_count * transaction_size_bytes, cudaMemcpyHostToDevice));
 
-    checkCudaErrors(cudaMalloc((void**)&d_hashes_ping, transactions_count * SHA256_HASH_SIZE));
+    checkCudaErrors(cudaMalloc((void**)&dev_hashes_ping, transactions_count * SHA256_HASH_SIZE));
 
     int threads_per_block = THREADS_PER_BLOCK_MERKLE_INIT;
     /* Ceil the number of blocks */
     int blocks_no = (transactions_count + threads_per_block - 1) / threads_per_block;
 
-    initial_hash_kernel<<<blocks_no, threads_per_block>>>(transactions_dev, transaction_size_bytes, transactions_count, d_hashes_ping);
+    initial_hash_kernel<<<blocks_no, threads_per_block>>>(transactions_dev, transaction_size_bytes, transactions_count, dev_hashes_ping);
     checkCudaErrors(cudaGetLastError());
     checkCudaErrors(cudaDeviceSynchronize());
     checkCudaErrors(cudaFree(transactions_dev));
 
     int n_hashes = transactions_count;
 
-    /****************************** REDUCTION PHASE ******************************/
+    /************************************* REDUCTION PHASE ***********************************/
 
-   
+    // Max hashes for next level (output of reduction)
+    checkCudaErrors(cudaMalloc((void**)&dev_hashes_pong, ((n_hashes + 1) / 2) * SHA256_HASH_SIZE));
+
+    int threads_per_block_reduce = THREADS_PER_BLOCK_MERKLE_REDUCE;
+
+    while (n_hashes > 1) {
+        /* The number of hashes that will result on this level */
+        int out_hashes_on_this_level = (n_hashes + 1) / 2;
+        /* Ceil the number of blocks */
+        int blocks_no_reduce = (out_hashes_on_this_level + threads_per_block_reduce - 1) / threads_per_block_reduce;
+        
+        if (blocks_no_reduce > 0) {
+            reduce_merkle_level_kernel<<<blocks_no_reduce, threads_per_block_reduce>>>(
+                dev_hashes_ping,
+                n_hashes,
+                dev_hashes_pong);
+            checkCudaErrors(cudaGetLastError());
+            checkCudaErrors(cudaDeviceSynchronize());
+        }
+
+        n_hashes = out_hashes_on_this_level;
+
+        // Swap the input and output buffers for the next iter
+        BYTE* temp_ptr = dev_hashes_ping;
+        dev_hashes_ping = dev_hashes_pong;
+        dev_hashes_pong = temp_ptr;
+
+        if (n_hashes == 1) {
+            break;
+        }
+    }
+    // In the end, the first hash in dev_hashes_ping is the Merkle root
+    checkCudaErrors(cudaMemcpy(merkle_root_host, dev_hashes_ping, SHA256_HASH_SIZE, cudaMemcpyDeviceToHost));
+
+    checkCudaErrors(cudaFree(dev_hashes_ping));
+    checkCudaErrors(cudaFree(dev_hashes_pong));
 }
 
 // TODO 2: Implement this function in CUDA
