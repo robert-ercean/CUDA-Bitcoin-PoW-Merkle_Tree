@@ -256,20 +256,15 @@ __global__ void find_nonce_kernel(
         }
 
         int nonce_len = intToString(nonce, nonce_str);
-        for (int i = 0; i < nonce_len; i++) {
-            local_block[current_length + i] = nonce_str[i];
-        }
+        memcpy(local_block + current_length, nonce_str, nonce_len);
         local_block[current_length + nonce_len] = '\0';
 
         apply_sha256(local_block, local_hash);
 
-        // Atomically check if a nonce has not already been found
+        // Atomically check if a nonce has not already been found, and set the flag to 1
         if (compare_hashes(local_hash, difficulty) <= 0 && (atomicExch(found_flag, 1) == 0)) {
             *result_nonce = nonce;
-            #pragma unroll
-            for (int i = 0; i < SHA256_HASH_SIZE; i++) {
-                out_hash[i] = local_hash[i];
-            }
+            memcpy(out_hash, local_hash, SHA256_HASH_SIZE);
         }
     }
 }
@@ -277,7 +272,7 @@ __global__ void find_nonce_kernel(
 
 
 int find_nonce(BYTE *difficulty, uint32_t max_nonce, BYTE *block_content, size_t current_length, BYTE *block_hash, uint32_t *valid_nonce) {
-    // Initialize device memory pointers and alloc memory
+    // Initialize device memory pointers and alloc device memory
     BYTE *dev_difficulty, *dev_block_content, *dev_block_hash;
     uint32_t *dev_valid_nonce;
     int *dev_found_flag;
